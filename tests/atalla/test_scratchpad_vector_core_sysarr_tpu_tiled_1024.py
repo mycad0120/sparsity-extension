@@ -28,18 +28,39 @@ SPAD_NUM_BANKS = 32
 SPAD_ELEM_BYTES = 2
 SPAD_BANK_SIZE = SPAD_TOTAL_BYTES // (SPAD_NUM_TILES * SPAD_NUM_BANKS * SPAD_ELEM_BYTES)
 
-
+'''
 def _act_matrix_u16(size: int) -> np.ndarray:
     rows = np.arange(size, dtype=np.int32)[:, None]
     cols = np.arange(size, dtype=np.int32)[None, :]
     return ((cols * size + rows) % 3 + 1).astype(np.int32)
+'''
 
+# Activation matrix: M rows x K columns
+def _act_matrix_u16(m: int, k: Optional[int] = None) -> np.ndarray:
+    # If k is not given, activation matrix is square (m x m)
+    if (k is None):
+        k = m
 
+    rows = np.arange(m, dtype=np.int32)[:, None]
+    cols = np.arange(k, dtype=np.int32)[None, :]
+    return ((cols * m + rows) % 3 + 1).astype(np.int32)
+
+'''
 def _weights_matrix_u16(size: int) -> np.ndarray:
     rows = np.arange(size, dtype=np.int32)[:, None]
     cols = np.arange(size, dtype=np.int32)[None, :]
     return ((rows * size + cols) % 5 + 1).astype(np.int32)
+'''
 
+# Weight matrix: K rows x N columns
+def _weights_matrix_u16(k: int, n: Optional[int] = None) -> np.ndarray:
+    # If n is not given, weight matrix is square (k x k)
+    if (n is None):
+        n = k
+
+    rows = np.arange(k, dtype=np.int32)[:, None]
+    cols = np.arange(n, dtype=np.int32)[None, :]
+    return ((rows * n + cols) % 5 + 1).astype(np.int32)
 
 def _tile_weight_stream(tile: np.ndarray) -> List[List[int]]:
     size = int(tile.shape[0])
@@ -64,7 +85,7 @@ def _decode_fp16_vector(values: List[int]) -> List[float]:
 def _encode_fp16_vector(values: List[float]) -> List[int]:
     return [_fp16_bits(value) for value in values]
 
-
+'''
 def _expected_tiled_fp16_accum(act: np.ndarray, wgt: np.ndarray, tile_size: int) -> np.ndarray:
     matrix_size = int(act.shape[0])
     num_tiles = matrix_size // int(tile_size)
@@ -74,7 +95,28 @@ def _expected_tiled_fp16_accum(act: np.ndarray, wgt: np.ndarray, tile_size: int)
         partial = (act[:, k_slice] @ wgt[k_slice, :]).astype(np.float16)
         accum = (accum + partial).astype(np.float16)
     return np.rint(accum).astype(np.int32)
+'''
 
+# Compute the expected output of a tiled matrix multiply with fp16 accumulation.
+def _expected_tiled_fp16_accum(act: np.ndarray, wgt: np.ndarray, tile_size: int) -> np.ndarray:
+    # Rows of activation matrix (and of the output matrix) is m, columns of activation matrix (and rows of weight matrix) is k, columns of weight matrix (and of the output matrix) is n
+    m = int(act.shape[0])
+    # Shared dimension between activation and weight matrices
+    k = int(act.shape[1])
+    # Columns of weight matrix (and of the output matrix)
+    n = int(wgt.shape[1])
+    # Activation matrix's columns must match weight matrix's rows
+    assert wgt.shape[0] == k
+    # K must be a whole number of tiles
+    assert (k % tile_size) == 0
+    num_k_tiles = k // int(tile_size)
+    # Output matrix is M x N
+    accum = np.zeros((m, n), dtype=np.float16)
+    for tk in range(num_k_tiles):
+        k_slice = slice(tk * tile_size, (tk + 1) * tile_size)
+        partial = (act[:, k_slice] @ wgt[k_slice, :]).astype(np.float16)
+        accum = (accum + partial).astype(np.float16)
+    return np.rint(accum).astype(np.int32)
 
 def _summarize_cycle_values(values: List[int]) -> Dict[str, float]:
     if not values:
