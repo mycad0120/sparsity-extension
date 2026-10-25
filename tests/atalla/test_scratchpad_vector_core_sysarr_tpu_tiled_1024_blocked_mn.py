@@ -1023,8 +1023,11 @@ class MNReuseBlockedTPUCosim(TiledTPUCosim):
         return tile_out
 
     def _run_output_block(self, ti0: int, tj0: int, act: np.ndarray, wgt: np.ndarray) -> Dict[Tuple[int, int], np.ndarray]:
-        activation_tiles = min(self.activation_reuse_n, self.num_tiles - ti0)
-        weight_tiles = min(self.weight_reuse_m, self.num_tiles - tj0)
+        # activation_tiles = min(self.activation_reuse_n, self.num_tiles - ti0)
+        # How many tiles are left in this block (the last block can be smaller)
+        activation_tiles = min(self.activation_reuse_n, self.tiles_m - ti0)
+        # weight_tiles = min(self.weight_reuse_m, self.num_tiles - tj0)
+        weight_tiles = min(self.weight_reuse_m, self.tiles_n - tj0)
         layout = self._build_reuse_layout(activation_tiles, weight_tiles)
         self._clear_block_psums(layout)
         self.timeline.append(
@@ -1034,7 +1037,8 @@ class MNReuseBlockedTPUCosim(TiledTPUCosim):
             )
         )
 
-        for tk in range(self.num_tiles):
+        # for tk in range(self.num_tiles):
+        for tk in range(self.tiles_k):
             act_tiles, wgt_tiles = self._prefetch_block_operands(
                 layout=layout,
                 ti0=ti0,
@@ -1078,10 +1082,15 @@ class MNReuseBlockedTPUCosim(TiledTPUCosim):
         return outputs
 
     def run(self, act: np.ndarray, wgt: np.ndarray) -> Tuple[np.ndarray, Dict[str, int]]:
-        got = np.zeros((self.matrix_size, self.matrix_size), dtype=np.int32)
+        assert act.shape == (self.matrix_m, self.matrix_k)
+        assert wgt.shape == (self.matrix_k, self.matrix_n)
+        # got = np.zeros((self.matrix_size, self.matrix_size), dtype=np.int32)
+        got = np.zeros((self.matrix_m, self.matrix_n), dtype=np.int32)
 
-        for ti0 in range(0, self.num_tiles, self.activation_reuse_n):
-            for tj0 in range(0, self.num_tiles, self.weight_reuse_m):
+        # for ti0 in range(0, self.num_tiles, self.activation_reuse_n):
+        for ti0 in range(0, self.tiles_m, self.activation_reuse_n):
+            # for tj0 in range(0, self.num_tiles, self.weight_reuse_m):
+            for tj0 in range(0, self.tiles_n, self.weight_reuse_m):
                 block_outputs = self._run_output_block(ti0, tj0, act, wgt)
                 for (ti, tj), tile_out in block_outputs.items():
                     row_slice = slice(ti * self.tile_size, (ti + 1) * self.tile_size)
