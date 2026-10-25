@@ -60,6 +60,18 @@ def _weights_matrix_u16(k: int, n: Optional[int] = None) -> np.ndarray:
     cols = np.arange(n, dtype=np.int32)[None, :]
     return ((rows * n + cols) % 5 + 1).astype(np.int32)
 
+def _select_dimensions(matrix_size, M, N, K):
+    # Names of the dimensions that were not given
+    missing = [name for name, value in (("M", M), ("N", N), ("K", K)) if value is None]
+    # All 3 given -> rectangular (matrix_size is ignored)
+    if (len(missing) == 0):
+        return M, N, K
+    # None given -> square matrix
+    if (len(missing) == 3):
+        return matrix_size, matrix_size, matrix_size
+    # Some but not all given -> invalid
+    raise AssertionError(f"M, N, K must all be specified if not using matrix_size. Missing matrix dimensions: {', '.join(missing)}")
+
 def _tile_weight_stream(tile: np.ndarray) -> List[List[int]]:
     size = int(tile.shape[0])
     return [[int(tile[r, c]) for r in range(size)] for c in range(size - 1, -1, -1)]
@@ -215,7 +227,7 @@ class TiledTPUCosim:
             matrix_k = matrix_size
         # If some but not all matrix dimensions are missing, raise an error.
         elif (0 < len(missing) < 3):
-            raise AssertionError(f"matrix_m, matrix_n, and matrix_k must all be specified if not using matrix_size. Missing matrix dimensions: {missing}")
+            raise AssertionError(f"matrix_m, matrix_n, and matrix_k must all be specified if not using matrix_size. Missing matrix dimensions: {', '.join(missing)}")
         self.matrix_m = int(matrix_m)
         self.matrix_n = int(matrix_n)
         self.matrix_k = int(matrix_k)
@@ -615,6 +627,14 @@ class TiledTPUCosim:
             "matrix_size": self.matrix_size,
             "tile_size": self.tile_size,
             "num_tiles": self.num_tiles,
+            "matrix_m": self.matrix_m,
+            "matrix_n": self.matrix_n,
+            "matrix_k": self.matrix_k,
+            "tiles_m": self.tiles_m,
+            "tiles_n": self.tiles_n,
+            "tiles_k": self.tiles_k,
+            # Algorithmic FLOPs: 2*M*N*K (a multiply and an add per K step, for each of M*N outputs)
+            "flops_algo": 2 * self.matrix_m * self.matrix_n * self.matrix_k,
             "spad_frontend_queue_size": self.spad_frontend_queue_size,
             "backend_dram_burst_bytes": self.backend_dram_burst_bytes,
             "kernel_gantt_tag_count": len(self.kernel_tag_info),
@@ -628,7 +648,8 @@ class TiledTPUCosim:
             "sa_stats_not_applicable": list(
                 getattr(self.sa, "INAPPLICABLE_STATS", ())),
             "total_tile_pairs": self.total_tile_pairs,
-            "total_output_tiles": self.num_tiles ** 2,
+            # "total_output_tiles": self.num_tiles ** 2,
+            "total_output_tiles": self.tiles_m * self.tiles_n,
         }
 
     def _init_platform(self) -> None:
@@ -1143,22 +1164,36 @@ class TiledTPUCosim:
                     f"cycle {self.global_cycle}: output tile complete ti={ti} tj={tj}"
                 )
 
+        # Every (ti, tj, tk) combination must have run once
+        assert self.total_tile_pairs == self.tiles_m * self.tiles_n * self.tiles_k
+
         stats = {
             "matrix_size": self.matrix_size,
             "tile_size": self.tile_size,
             "num_tiles": self.num_tiles,
             "prefetch_slots": 2,
             "total_tile_pairs": self.total_tile_pairs,
-            "total_output_tiles": self.num_tiles ** 2,
+            # "total_output_tiles": self.num_tiles ** 2,
+            "total_output_tiles": self.tiles_m * self.tiles_n,
+            "matrix_m": self.matrix_m,
+            "matrix_n": self.matrix_n,
+            "matrix_k": self.matrix_k,
+            "tiles_m": self.tiles_m,
+            "tiles_n": self.tiles_n,
+            "tiles_k": self.tiles_k,
             "cycles": self.global_cycle,
         }
         return got, stats
 
 
-def run_tiled_tpu_cosim(matrix_size: int = MATRIX, tile_size: int = TILE) -> Tuple[np.ndarray, Dict[str, int], TiledTPUCosim]:
-    act = _act_matrix_u16(matrix_size)
-    wgt = _weights_matrix_u16(matrix_size)
-    runner = TiledTPUCosim(matrix_size=matrix_size, tile_size=tile_size, dtype="fp16")
+def run_tiled_tpu_cosim(matrix_size: int = MATRIX, tile_size: int = TILE, matrix_m: Optional[int] = None, matrix_n: Optional[int] = None, matrix_k: Optional[int] = None) -> Tuple[np.ndarray, Dict[str, int], TiledTPUCosim]:
+    M, N, K = _select_dimensions(matrix_size, matrix_m, matrix_n, matrix_k)
+    # act = _act_matrix_u16(matrix_size)
+    act = _act_matrix_u16(M, K)
+    # wgt = _weights_matrix_u16(matrix_size)
+    wgt = _weights_matrix_u16(K, N)
+    # runner = TiledTPUCosim(matrix_size=matrix_size, tile_size=tile_size, dtype="fp16")
+    runner = TiledTPUCosim(matrix_m=M, matrix_n=N, matrix_k=K, tile_size=tile_size, dtype="fp16")
     expected = _expected_tiled_fp16_accum(act, wgt, tile_size)
     got, _ = runner.run(act, wgt)
     stats = runner.build_stats(got, expected)
@@ -1220,8 +1255,11 @@ def _write_logs(runner: TiledTPUCosim, stats: Dict[str, int], log_dir: Path) -> 
         dprintf(
             "harness",
             (
-                f"Config matrix_size={runner.matrix_size} tile_size={runner.tile_size} "
-                f"num_tiles={runner.num_tiles} prefetch_slots=2 "
+                # f"Config matrix_size={runner.matrix_size} tile_size={runner.tile_size} "
+                f"Config M={runner.matrix_m} N={runner.matrix_n} K={runner.matrix_k} "
+                # f"num_tiles={runner.num_tiles} prefetch_slots=2 "
+                f"tile_size={runner.tile_size} tiles_m={runner.tiles_m} "
+                f"tiles_n={runner.tiles_n} tiles_k={runner.tiles_k} prefetch_slots=2 "
                 f"load_issue_window={runner.load_issue_window} store_issue_window={runner.store_issue_window}"
             ),
         )
@@ -1284,6 +1322,9 @@ def test_scratchpad_vector_core_sysarr_tpu_tiled_1024x1024() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cycle-accurate tiled TPU co-sim")
     parser.add_argument("--matrix-size", type=int, default=MATRIX)
+    parser.add_argument("--M", type=int, default=None)
+    parser.add_argument("--N", type=int, default=None)
+    parser.add_argument("--K", type=int, default=None)
     parser.add_argument("--tile-size", type=int, default=TILE)
     parser.add_argument("--backend-dram-burst-bytes", type=int, default=32)
     parser.add_argument("--systolic-array", choices=("tpu", "meissa"), default="tpu",
@@ -1299,12 +1340,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    act = _act_matrix_u16(args.matrix_size)
-    wgt = _weights_matrix_u16(args.matrix_size)
+    try:
+        M, N, K = _select_dimensions(args.matrix_size, args.M, args.N, args.K)
+    except AssertionError as err:
+        parser.error(str(err))
+    # act = _act_matrix_u16(args.matrix_size)
+    act = _act_matrix_u16(M, K)
+    # wgt = _weights_matrix_u16(args.matrix_size)
+    wgt = _weights_matrix_u16(K, N)
+    # expected = _expected_tiled_fp16_accum(act, wgt, args.tile_size)
     expected = _expected_tiled_fp16_accum(act, wgt, args.tile_size)
 
     runner = TiledTPUCosim(
-        matrix_size=args.matrix_size,
+        # matrix_size=args.matrix_size,
+        matrix_m=M,
+        matrix_n=N,
+        matrix_k=K,
         tile_size=args.tile_size,
         dtype="fp16",
         backend_dram_burst_bytes=args.backend_dram_burst_bytes,
