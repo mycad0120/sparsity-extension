@@ -40,7 +40,6 @@ def _act_matrix_u16(m: int, k: Optional[int] = None) -> np.ndarray:
     # If k is not given, activation matrix is square (m x m)
     if (k is None):
         k = m
-
     rows = np.arange(m, dtype=np.int32)[:, None]
     cols = np.arange(k, dtype=np.int32)[None, :]
     return ((cols * m + rows) % 3 + 1).astype(np.int32)
@@ -57,7 +56,6 @@ def _weights_matrix_u16(k: int, n: Optional[int] = None) -> np.ndarray:
     # If n is not given, weight matrix is square (k x k)
     if (n is None):
         n = k
-
     rows = np.arange(k, dtype=np.int32)[:, None]
     cols = np.arange(n, dtype=np.int32)[None, :]
     return ((rows * n + cols) % 5 + 1).astype(np.int32)
@@ -187,6 +185,10 @@ class TiledTPUCosim:
         systolic_array: str = "tpu",
         spad_num_tiles: int = SPAD_NUM_TILES,
         collect_sa_stats: bool = True,
+        # Optional matrix dimensions for non-square matrices.
+        matrix_m: Optional[int] = None,
+        matrix_n: Optional[int] = None,
+        matrix_k: Optional[int] = None,
     ):
         """systolic_array / spad_num_tiles select the architecture.
 
@@ -199,10 +201,40 @@ class TiledTPUCosim:
         A pad is one prefetch slot: its own bank array, its own DRAM backend
         and its own VLSU, all indexed by the same integer.
         """
-        self.matrix_size = int(matrix_size)
+        # self.matrix_size = int(matrix_size)
         self.tile_size = int(tile_size)
-        self.num_tiles = self.matrix_size // self.tile_size
-        assert self.matrix_size % self.tile_size == 0
+        # self.num_tiles = self.matrix_size // self.tile_size
+        # assert self.matrix_size % self.tile_size == 0
+        dims = {"matrix_m": matrix_m, "matrix_n": matrix_n, "matrix_k": matrix_k}
+        # Determine which matrix dimensions are missing.
+        missing = [name for name, value in dims.items() if value is None]
+        # If all three matrix dimensions are missing, use the matrix_size for all.
+        if (len(missing) == 3):
+            matrix_m = matrix_size
+            matrix_n = matrix_size
+            matrix_k = matrix_size
+        # If some but not all matrix dimensions are missing, raise an error.
+        elif (0 < len(missing) < 3):
+            raise AssertionError(f"matrix_m, matrix_n, and matrix_k must all be specified if not using matrix_size. Missing matrix dimensions: {missing}")
+        self.matrix_m = int(matrix_m)
+        self.matrix_n = int(matrix_n)
+        self.matrix_k = int(matrix_k)
+        # Every matrix dimension must be a multiple of the tile size.
+        assert self.matrix_m % self.tile_size == 0
+        assert self.matrix_n % self.tile_size == 0
+        assert self.matrix_k % self.tile_size == 0
+        # Number of tiles along each matrix dimension.
+        self.tiles_m = self.matrix_m // self.tile_size
+        self.tiles_n = self.matrix_n // self.tile_size
+        self.tiles_k = self.matrix_k // self.tile_size
+        # If the matrix is square, store its size and the number of tiles along one dimension.
+        if ((self.matrix_m == self.matrix_n) and (self.matrix_n == self.matrix_k)):
+            self.matrix_size = self.matrix_m
+            self.num_tiles = self.tiles_m
+        # Otherwise, set both to None.
+        else:
+            self.matrix_size = None
+            self.num_tiles = None
         self.dtype = str(dtype)
         self.spad_frontend_queue_size = max(1, int(spad_frontend_queue_size))
         self.backend_dram_burst_bytes = max(1, int(backend_dram_burst_bytes))
@@ -237,9 +269,13 @@ class TiledTPUCosim:
         self.global_cycle = 0
         self.timeline: List[str] = []
         self.total_tile_pairs = 0
-        self.progress_total = 32_768
+        # self.progress_total = 32_768
+        # Total number of tile pairs to be processed.
+        self.progress_total = self.tiles_m * self.tiles_n * self.tiles_k
         self.output_gemms_completed = 0
-        self.output_gemms_total = self.matrix_size * self.matrix_size
+        # self.output_gemms_total = self.matrix_size * self.matrix_size
+        # Total number of output GEMMs is the product of the matrix dimensions M and N (K is the summation dimension, not counted in the output).
+        self.output_gemms_total = self.matrix_m * self.matrix_n
         self._init_metrics()
 
         self._init_platform()
