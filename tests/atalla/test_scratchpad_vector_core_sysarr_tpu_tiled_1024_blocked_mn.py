@@ -175,6 +175,9 @@ class MNReuseBlockedTPUCosim(TiledTPUCosim):
         backend_dram_burst_bytes: int = 32,
         systolic_array: str = "tpu",
         spad_num_tiles: int = SPAD_NUM_TILES,
+        matrix_m: Optional[int] = None,
+        matrix_n: Optional[int] = None,
+        matrix_k: Optional[int] = None,
     ):
         self.weight_reuse_m = max(1, int(weight_reuse_m))
         self.activation_reuse_n = max(1, int(activation_reuse_n))
@@ -186,9 +189,16 @@ class MNReuseBlockedTPUCosim(TiledTPUCosim):
             backend_dram_burst_bytes=backend_dram_burst_bytes,
             systolic_array=systolic_array,
             spad_num_tiles=spad_num_tiles,
+            matrix_m=matrix_m,
+            matrix_n=matrix_n,
+            matrix_k=matrix_k,
         )
-        self.weight_reuse_m = min(self.weight_reuse_m, self.num_tiles)
-        self.activation_reuse_n = min(self.activation_reuse_n, self.num_tiles)
+        # self.weight_reuse_m = min(self.weight_reuse_m, self.num_tiles)
+        # Weight reuse is limited by the number of tiles along the N dimension.
+        self.weight_reuse_m = min(self.weight_reuse_m, self.tiles_n)
+        # Activation reuse is limited by the number of tiles along the M dimension.
+        # self.activation_reuse_n = min(self.activation_reuse_n, self.num_tiles)
+        self.activation_reuse_n = min(self.activation_reuse_n, self.tiles_m)
 
     def _preferred_tiles(self, kind: str) -> Tuple[int, ...]:
         """Which pad each kind of buffer wants, best first.
