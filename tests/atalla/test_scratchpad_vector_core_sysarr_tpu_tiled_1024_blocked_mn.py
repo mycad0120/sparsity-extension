@@ -1515,6 +1515,50 @@ def test_blocked_mn_write_logs_emits_tk_gantt_plots() -> None:
         assert presentation_reuse_balance.stat().st_size > 0
 
 
+def test_rect_64x96x128() -> None:
+    # tile grid 2 x 3 x 4
+    got, stats, _ = run_blocked_mn_tpu_cosim(matrix_m=64, matrix_n=96, matrix_k=128, weight_reuse_m=3, activation_reuse_n=2)
+    act = _act_matrix_u16(64, 128)
+    wgt = _weights_matrix_u16(128, 96)
+    assert got.shape == (64, 96)
+    assert np.array_equal(got, act @ wgt)
+    assert stats["max_abs_error"] == 0.0
+    assert stats["total_tile_pairs"] == 2 * 3 * 4
+
+
+def test_rect_32x128x64() -> None:
+    # tile grid 1 x 4 x 2
+    got, stats, _ = run_blocked_mn_tpu_cosim(matrix_m=32, matrix_n=128, matrix_k=64, weight_reuse_m=4, activation_reuse_n=1)
+    act = _act_matrix_u16(32, 64)
+    wgt = _weights_matrix_u16(64, 128)
+    assert np.array_equal(got, act @ wgt)
+    assert stats["total_tile_pairs"] == 1 * 4 * 2
+
+
+def test_rect_edge_block() -> None:
+    # tile grid 5 x 3 x 2, reuse 2 and 2 -> last block are smaller (5 = 2 + 2 + 1, 3 = 2 + 1)
+    got, stats, _ = run_blocked_mn_tpu_cosim(matrix_m=160, matrix_n=96, matrix_k=64, weight_reuse_m=2, activation_reuse_n=2)
+    act = _act_matrix_u16(160, 64)
+    wgt = _weights_matrix_u16(64, 96)
+    assert np.array_equal(got, act @ wgt)
+    assert stats["total_tile_pairs"] == 5 * 3 * 2
+    assert stats["total_output_tiles"] == 5 * 3
+
+
+def test_rect_policy_outputs_same_result() -> None:
+    """
+    The reuse policy changes how tiles are grouped and scheduled, so cycles differ,
+    but the computed output must not.  Run the same 160x96x64 GEMM (5 x 3 x 2 tile grid)
+    with the smallest and the largest block sizes and compare the results.
+    """
+    # m1_n1: 1 weight tile and 1 activation tile per block (no reuse)
+    m1_n1_out, _, _ = run_blocked_mn_tpu_cosim(matrix_m=160, matrix_n=96, matrix_k=64, weight_reuse_m=1, activation_reuse_n=1)
+    # m3_n5: 3 weight tiles (all of N) and 5 activation tiles (all of M) per block (max reuse)
+    m3_n5_out, _, _ = run_blocked_mn_tpu_cosim(matrix_m=160, matrix_n=96, matrix_k=64, weight_reuse_m=3, activation_reuse_n=5)
+    # Both outputs should be identical
+    assert np.array_equal(m1_n1_out, m3_n5_out)
+
+    
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cycle-accurate blocked tiled TPU co-sim")
     parser.add_argument("--matrix-size", type=int, default=MATRIX)
