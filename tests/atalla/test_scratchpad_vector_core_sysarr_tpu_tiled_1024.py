@@ -893,12 +893,14 @@ class TiledTPUCosim:
         completed_k = 0
         tile_start_cycle = self.global_cycle
 
-        while completed_k < self.num_tiles:
+        # while completed_k < self.num_tiles:
+        while (completed_k < self.tiles_k):
             if self.global_cycle - tile_start_cycle > 1_000_000:
                 raise AssertionError(f"output tile ti={ti} tj={tj} exceeded cycle budget")
 
             free_slots = [slot for slot in (0, 1) if slot not in jobs_by_slot]
-            while free_slots and next_k_to_launch < self.num_tiles:
+            # while free_slots and next_k_to_launch < self.num_tiles:
+            while (free_slots and next_k_to_launch < self.tiles_k):
                 slot = free_slots.pop(0)
                 k_slice = slice(next_k_to_launch * self.tile_size, (next_k_to_launch + 1) * self.tile_size)
                 job = TileJob(
@@ -1103,17 +1105,27 @@ class TiledTPUCosim:
                 )
                 self._accumulate_sa_metrics()
                 current_job = None
-                if completed_k < self.num_tiles:
+                # if completed_k < self.num_tiles:
+                if (completed_k < self.tiles_k):
                     self._reset_compute_pipeline()
 
         self._drain_compute_path()
         return self._drain_accumulator_tile_to_dram()
 
     def run(self, act: np.ndarray, wgt: np.ndarray) -> Tuple[np.ndarray, Dict[str, int]]:
-        got = np.zeros((self.matrix_size, self.matrix_size), dtype=np.int32)
+        # Activation must be M x K and weight must be K x N
+        assert act.shape == (self.matrix_m, self.matrix_k)
+        assert wgt.shape == (self.matrix_k, self.matrix_n)
+        # got = np.zeros((self.matrix_size, self.matrix_size), dtype=np.int32)
+        # Output matrix must be M x N
+        got = np.zeros((self.matrix_m, self.matrix_n), dtype=np.int32)
 
-        for ti in range(self.num_tiles):
-            for tj in range(self.num_tiles):
+        # for ti in range(self.num_tiles):
+        # Output tile row
+        for ti in range(self.tiles_m):
+            # for tj in range(self.num_tiles):
+            # Output tile column
+            for tj in range(self.tiles_n):
                 tile_out = self._run_output_tile(ti, tj, act, wgt)
                 row_slice = slice(ti * self.tile_size, (ti + 1) * self.tile_size)
                 col_slice = slice(tj * self.tile_size, (tj + 1) * self.tile_size)
