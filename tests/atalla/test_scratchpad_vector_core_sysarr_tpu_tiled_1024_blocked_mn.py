@@ -37,6 +37,7 @@ TILE = legacy.TILE
 TiledTPUCosim = legacy.TiledTPUCosim
 _act_matrix_u16 = legacy._act_matrix_u16
 _weights_matrix_u16 = legacy._weights_matrix_u16
+_select_dimensions = legacy._select_dimensions
 _expected_tiled_fp16_accum = legacy._expected_tiled_fp16_accum
 _tile_weight_stream = legacy._tile_weight_stream
 _write_dram_tile_u16 = legacy._write_dram_tile_u16
@@ -1105,15 +1106,25 @@ class MNReuseBlockedTPUCosim(TiledTPUCosim):
                         ),
                         flush=True,
                     )
+        # Every (ti, tj, tk) combination must have run once
+        expected_pairs = self.tiles_m * self.tiles_n * self.tiles_k
+        assert self.total_tile_pairs == expected_pairs, f"Expected {expected_pairs} tile pairs, but got {self.total_tile_pairs}"
 
         stats = {
             "matrix_size": self.matrix_size,
+            "matrix_m": self.matrix_m,
+            "matrix_n": self.matrix_n,
+            "matrix_k": self.matrix_k,
             "tile_size": self.tile_size,
             "num_tiles": self.num_tiles,
+            "tiles_m": self.tiles_m,
+            "tiles_n": self.tiles_n,
+            "tiles_k": self.tiles_k,
             "weight_reuse_m": self.weight_reuse_m,
             "activation_reuse_n": self.activation_reuse_n,
             "total_tile_pairs": self.total_tile_pairs,
-            "total_output_tiles": self.num_tiles ** 2,
+            # "total_output_tiles": self.num_tiles ** 2,
+            "total_output_tiles": self.tiles_m * self.tiles_n,
             "cycles": self.global_cycle,
         }
         return got, stats
@@ -1126,11 +1137,20 @@ def run_blocked_mn_tpu_cosim(
     activation_reuse_n: int = 1,
     spad_frontend_queue_size: int = 4,
     backend_dram_burst_bytes: int = 32,
+    matrix_m: Optional[int] = None,
+    matrix_n: Optional[int] = None,
+    matrix_k: Optional[int] = None,
 ) -> Tuple[np.ndarray, Dict[str, int], MNReuseBlockedTPUCosim]:
-    act = _act_matrix_u16(matrix_size)
-    wgt = _weights_matrix_u16(matrix_size)
+    M, N, K = _select_dimensions(matrix_size, matrix_m, matrix_n, matrix_k)
+    # act = _act_matrix_u16(matrix_size)
+    act = _act_matrix_u16(M, K)
+    # wgt = _weights_matrix_u16(matrix_size)
+    wgt = _weights_matrix_u16(K, N)
     runner = MNReuseBlockedTPUCosim(
-        matrix_size=matrix_size,
+        # matrix_size=matrix_size,
+        matrix_m=M,
+        matrix_n=N,
+        matrix_k=K,
         tile_size=tile_size,
         weight_reuse_m=weight_reuse_m,
         activation_reuse_n=activation_reuse_n,
@@ -1300,7 +1320,10 @@ def _write_logs(runner: MNReuseBlockedTPUCosim, stats: Dict[str, object], log_di
         dprintf(
             "harness",
             (
-                f"Config matrix_size={runner.matrix_size} tile_size={runner.tile_size} num_tiles={runner.num_tiles} "
+                # f"Config matrix_size={runner.matrix_size} tile_size={runner.tile_size} num_tiles={runner.num_tiles} "
+                f"Config M={runner.matrix_m} N={runner.matrix_n} K={runner.matrix_k}"
+                f"tile_size={runner.tile_size} tiles_m={runner.tiles_m} "
+                f"tiles_n={runner.tiles_n} tiles_k={runner.tiles_k} "
                 f"weight_reuse_m={runner.weight_reuse_m} activation_reuse_n={runner.activation_reuse_n}"
             ),
         )
@@ -1495,6 +1518,9 @@ def test_blocked_mn_write_logs_emits_tk_gantt_plots() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cycle-accurate blocked tiled TPU co-sim")
     parser.add_argument("--matrix-size", type=int, default=MATRIX)
+    parser.add_argument("--M", type=int, default=None)
+    parser.add_argument("--N", type=int, default=None)
+    parser.add_argument("--K", type=int, default=None)
     parser.add_argument("--tile-size", type=int, default=TILE)
     parser.add_argument("--weight-reuse-m", type=int, default=1)
     parser.add_argument("--activation-reuse-n", type=int, default=1)
@@ -1509,12 +1535,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    act = _act_matrix_u16(args.matrix_size)
-    wgt = _weights_matrix_u16(args.matrix_size)
+    try:
+        M, N, K = _select_dimensions(args.matrix_size, args.M, args.N, args.K)
+    except AssertionError as err:
+        parser.error(str(err))
+    # act = _act_matrix_u16(args.matrix_size)
+    act = _act_matrix_u16(M, K)
+    # wgt = _weights_matrix_u16(args.matrix_size)
+    wgt = _weights_matrix_u16(K, N)
     expected = _expected_tiled_fp16_accum(act, wgt, args.tile_size)
 
     runner = MNReuseBlockedTPUCosim(
-        matrix_size=args.matrix_size,
+        # matrix_size=args.matrix_size,
+        matrix_m=M,
+        matrix_n=N,
+        matrix_k=K,
         tile_size=args.tile_size,
         weight_reuse_m=args.weight_reuse_m,
         activation_reuse_n=args.activation_reuse_n,
