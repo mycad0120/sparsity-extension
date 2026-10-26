@@ -72,6 +72,23 @@ def _select_dimensions(matrix_size, M, N, K):
     # Some but not all given -> invalid
     raise AssertionError(f"M, N, K must all be specified if not using matrix_size. Missing matrix dimensions: {', '.join(missing)}")
 
+def pad_k_to_tile(act: np.ndarray, wgt: np.ndarray, tile_size: int):
+    # Zero-pad K up to the next multiple of tile_size, so the array sees whole tiles.
+    # ResNet-50 conv1 (im2col) has K=147, which becomes 160 (5 tiles of 32).
+    m = act.shape[0]
+    k = act.shape[1]
+    n = wgt.shape[1]
+    # Round K up to a multiple of tile_size
+    padded_k = ((k + tile_size - 1) // tile_size) * tile_size
+    extra = padded_k - k
+    '''
+    Add `extra` zero columns to activation and `extra` zero rows to weight. Zeros add nothing to
+    any dot product, so the GEMM result is identical to the unpadded one.
+    '''
+    act = np.pad(act, ((0, 0), (0, extra)))
+    wgt = np.pad(wgt, ((0, extra), (0, 0)))
+    return act, wgt
+
 def _tile_weight_stream(tile: np.ndarray) -> List[List[int]]:
     size = int(tile.shape[0])
     return [[int(tile[r, c]) for r in range(size)] for c in range(size - 1, -1, -1)]
@@ -1325,6 +1342,7 @@ def main() -> None:
     parser.add_argument("--M", type=int, default=None)
     parser.add_argument("--N", type=int, default=None)
     parser.add_argument("--K", type=int, default=None)
+    parser.add_argument("--pad-k", action="store_true")
     parser.add_argument("--tile-size", type=int, default=TILE)
     parser.add_argument("--backend-dram-burst-bytes", type=int, default=32)
     parser.add_argument("--systolic-array", choices=("tpu", "meissa"), default="tpu",
@@ -1348,6 +1366,11 @@ def main() -> None:
     act = _act_matrix_u16(M, K)
     # wgt = _weights_matrix_u16(args.matrix_size)
     wgt = _weights_matrix_u16(K, N)
+    flops_unpadded = None
+    if (args.pad_k):
+        flops_unpadded = 2 * M * N * K
+        act, wgt = pad_k_to_tile(act, wgt, args.tile_size)
+        K = act.shape[1]
     # expected = _expected_tiled_fp16_accum(act, wgt, args.tile_size)
     expected = _expected_tiled_fp16_accum(act, wgt, args.tile_size)
 
@@ -1364,6 +1387,8 @@ def main() -> None:
     )
     got, _ = runner.run(act, wgt)
     stats = runner.build_stats(got, expected)
+    if (flops_unpadded is not None):
+        stats["flops_algo_unpadded"] = flops_unpadded
     if not np.array_equal(got, expected):
         raise AssertionError("tiled TPU co-sim result mismatch")
     _write_logs(runner, stats, Path(args.log_dir))
