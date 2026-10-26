@@ -38,6 +38,7 @@ TiledTPUCosim = legacy.TiledTPUCosim
 _act_matrix_u16 = legacy._act_matrix_u16
 _weights_matrix_u16 = legacy._weights_matrix_u16
 _select_dimensions = legacy._select_dimensions
+pad_k_to_tile = legacy.pad_k_to_tile
 _expected_tiled_fp16_accum = legacy._expected_tiled_fp16_accum
 _tile_weight_stream = legacy._tile_weight_stream
 _write_dram_tile_u16 = legacy._write_dram_tile_u16
@@ -1558,13 +1559,25 @@ def test_rect_policy_outputs_same_result() -> None:
     # Both outputs should be identical
     assert np.array_equal(m1_n1_out, m3_n5_out)
 
-    
+
+def test_pad_k_to_tile_keeps_result() -> None:
+    # K=100 is not a multiple of 32, so it is padded up to 128
+    act = _act_matrix_u16(64, 100)
+    wgt = _weights_matrix_u16(100, 64)
+    padded_act, padded_wgt = pad_k_to_tile(act, wgt, 32)
+    assert padded_act.shape == (64, 128)
+    assert padded_wgt.shape == (128, 64)
+    # Zero padding should not affect the result
+    assert np.array_equal(padded_act @ padded_wgt, act @ wgt)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cycle-accurate blocked tiled TPU co-sim")
     parser.add_argument("--matrix-size", type=int, default=MATRIX)
     parser.add_argument("--M", type=int, default=None)
     parser.add_argument("--N", type=int, default=None)
     parser.add_argument("--K", type=int, default=None)
+    parser.add_argument("--pad-k", action="store_true")
     parser.add_argument("--tile-size", type=int, default=TILE)
     parser.add_argument("--weight-reuse-m", type=int, default=1)
     parser.add_argument("--activation-reuse-n", type=int, default=1)
@@ -1587,6 +1600,11 @@ def main() -> None:
     act = _act_matrix_u16(M, K)
     # wgt = _weights_matrix_u16(args.matrix_size)
     wgt = _weights_matrix_u16(K, N)
+    flops_unpadded = None
+    if (args.pad_k):
+        flops_unpadded = 2 * M * N * K
+        act, wgt = pad_k_to_tile(act, wgt, args.tile_size)
+        K = act.shape[1]
     expected = _expected_tiled_fp16_accum(act, wgt, args.tile_size)
 
     runner = MNReuseBlockedTPUCosim(
@@ -1605,6 +1623,8 @@ def main() -> None:
     )
     got, _ = runner.run(act, wgt)
     stats = runner.build_stats(got, expected)
+    if (flops_unpadded is not None):
+        stats["flops_algo_unpadded"] = flops_unpadded
     if not np.array_equal(got, expected):
         raise AssertionError("blocked tiled TPU co-sim result mismatch")
     _write_logs(runner, stats, Path(args.log_dir))
