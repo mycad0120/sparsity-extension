@@ -44,7 +44,8 @@ def sw(data, rs1, imm=0):
 
 
 def br(m, rs1, rs2, off, incr=0):
-    w = (off // 4) & 0x3FF
+    """`off` in bytes; the field counts 5-byte instructions."""
+    w = (off // 5) & 0x3FF
     return OP[m] | incr << 7 | (w >> 9) << 14 | rs1 << 15 | rs2 << 23 | (w & 0x1FF) << 31
 
 
@@ -63,7 +64,7 @@ def program(*packets):
 
 
 def core_for(prog, data=None, warm=True, **kw):
-    c = SchedulerCore(prog, data=data, **kw)
+    c = SchedulerCore(prog, data=data, history=True, **kw)
     if warm:
         c.warm_icache()
     return c
@@ -87,8 +88,8 @@ def writes_to(core, reg):
 def test_branch_fields():
     w = br("bne.s", 3, 4, -40, incr=5)
     assert branch_offset(w) == -40 and branch_increment(w) == 5
-    w = br("beq.s", 3, 4, 2044, incr=127)
-    assert branch_offset(w) == 2044 and branch_increment(w) == 127
+    w = br("beq.s", 3, 4, 2555, incr=127)          # the farthest forward: 511 instructions
+    assert branch_offset(w) == 2555 and branch_increment(w) == 127
 
 
 @pytest.mark.parametrize("m,a,b,want", [
@@ -109,8 +110,8 @@ def test_branch_compares_signed_and_increments_unsigned():
     assert (out.rd, out.value) == (1, u32(-1 + 100))
 
 
-def test_jal_offset_is_bytes():
-    op = decode_scalar(mi("jal", 9, 60))
+def test_jal_offset_counts_instructions():
+    op = decode_scalar(mi("jal", 9, 12))             # 12 instructions = 60 bytes
     out = control_outcome(op, 0x40, 0, 0)
     assert (out.target, out.rd, out.value) == (0x40 + 60, 9, 0x40 + 20)
 
@@ -343,7 +344,7 @@ def test_halt_waits_for_stores_and_writes_dirty_lines_back():
 def run_both(prog, data=None):
     g = golden.run_golden_state(prog, data)
     regs, mem = g["sregs"], g["mem"]
-    c = SchedulerCore(prog, data=data)
+    c = SchedulerCore(prog, data=data, history=True)
     c.run_until_done(limit=200_000)
     assert in_program_order(c)
     for r in range(1, 256):
@@ -434,7 +435,7 @@ def test_golden_random_programs_small_cache(seed):
     prog = random_program(100 + seed, n=80)
     g = golden.run_golden_state(prog, DATA)
     regs, mem = g["sregs"], g["mem"]
-    c = SchedulerCore(prog, data=DATA, dcache_config=DCacheConfig(
+    c = SchedulerCore(prog, data=DATA, history=True, dcache_config=DCacheConfig(
         size_bytes=512, ways=2, line_bytes=32, mshrs=2, targets_per_mshr=2))
     c.run_until_done(limit=200_000)
     assert in_program_order(c)

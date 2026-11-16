@@ -41,7 +41,8 @@ component.
 A packet issues as a whole, in a cycle where all of these hold:
 
 - **No hazard.** No source and no destination of any instruction is busy in
-  the scoreboard (read-after-write, write-after-write).
+  the scoreboard (read-after-write, write-after-write), and no SDMA's `rs1`
+  has a `vreg.st` outstanding (below).
 - **Every unit it needs is ready:**
   - scalar EX1–EX5;
   - the vector ALU, MUL and reduction lanes, the GSAU, and the move-to-scalar unit;
@@ -53,6 +54,20 @@ The scoreboard is a busy bit per register — 256 scalar, 256 vector, 16 mask �
 set when the instruction that writes it issues and cleared when its
 writeback reaches the register file. Cleared and set on one edge, it stays
 set. A dependent packet issues the cycle after its producer's writeback.
+
+`vreg.st` → SDMA ordering. A `vreg.st` reserves its `rs1`, the tile's base
+register, when it issues, and the scratchpad releases one reservation when
+that row's SRAM write is done. The release reaches decode 2 through the EX/WB
+latch, like an SDMA's completion. An SDMA (`scpad.st`, or `scpad.ld`, which
+would overwrite the tile) can't issue while its `rs1` holds any reservation;
+`vreg.st` itself never waits on them, so the stores to one tile pipeline. It
+is a count per register, not a bit, because a tile is many `vreg.st` on one
+`rs1`. The table has 8 registers, each counting to 63; a `vreg.st` that would
+need a ninth, or could overflow a count, stalls its packet. The halt waits
+for the table to empty, and a `vreg.st` and an SDMA on one `rs1` in one
+packet is a contract violation. The perf monitor reports these stalls as
+`stall:vst` and `stall:vst_full`. (`dependency_checker.sv` on
+`FA26_integration_l2wokr`; `vreg.ld` isn't gated.)
 
 Decode 2 owns three register files and reads every operand at issue, so the
 units downstream get data, not register numbers, and write-after-read is
@@ -188,7 +203,8 @@ document and the assembler, and otherwise the functional sim:
 | | model | RTL |
 |---|---|---|
 | load/store address | `rs1 + imm` | `imm` |
-| `jal`, `jalr` offset | bytes | × 4 |
+| branch, `jal` offset | instructions from the packet: `pc + imm × 5` | `pc + imm × 4` |
+| `jalr` offset | bytes: `rs1 + imm` | `rs1 + imm × 4` |
 | branch increment | unsigned 0..127 | sign-extended |
 | `blt`/`bge`/`bgt`/`ble` | signed (the functional sim compares unsigned) | signed |
 | scalar BF16 values | fp32 layout, BF16 in the upper half | lower half |
@@ -297,13 +313,134 @@ DMA, and they behind it. The icache starts cold (`warm_icache=True` for
 tests that time something else). The ports' `stats` count bursts, bytes,
 cycles busy and cycles lost to contention.
 
+**The AXI bus.** With `--axi` (`axi=True`; the default with
+`--dram ramulator`), the six masters reach DRAM through the `memory_FA26`
+branch's AXI interconnect and the Ramulator wrapper at its end
+(`src/memory/axi.py`; `rtl/modules/memory/axi_bus`, `ramulator_wrapper`).
+A scratchpad row is one read or write burst of 8-byte beats (the backend's
+`num_request + 1` per-beat requests), a cache line one burst of 8:
+
+| | read | write |
+|---|---|---|
+| per master | 4 bursts queued | 3 bursts and 31 beats queued |
+| arbitration | round robin, one burst a cycle | round robin, a burst at a time, held to its last beat |
+| to DRAM | every beat at once; beats back one a cycle for all masters, oldest burst first | one 8-byte write a beat |
+| timing | the wrapper takes a burst the cycle after the master offers it; a beat the DRAM completes in cycle c is the master's in c + 2 | the first beat goes 4 cycles after the master offers the burst, then one a cycle; B one cycle after the last; 2 idle cycles before the next burst (3 for the same master alone) |
+
+B comes back when the wrapper has taken the beats, not when the DRAM has
+written them. The RTL's wrapper registers ARREADY and WREADY but takes an AR
+or W beat on VALID alone, so it can lose a refused AR and take W beats twice,
+and it still packs 256-bit beats onto the 64-bit bus; the model takes each
+burst and beat once, as intended. `--no-axi` sends each 8-byte request
+straight to the DRAM model instead, one a cycle for all masters; `--axi` with
+`--dram fixed` puts a DRAM that answers in `--dram-latency` cycles behind the
+bus (`--dram-latency 0` measures the bus alone). Sizes are in `AXIParams`,
+including the wrapper's 8,192 burst slots. With the bus, the performance
+summary gives each master's AXI bursts and bytes and the read and write
+paths' bytes a cycle against their 8 each, and the activity view draws the
+two paths in place of the shared channel.
+
+**DRAM timing from Ramulator 2.** With `--dram ramulator`
+(`dram_channel=RamulatorDRAM()` from Python; `src/memory/ramulator.py`), the
+channel is Ramulator 2's DDR4 controller instead of a fixed latency. A request
+completes when Ramulator says so: a read when its data returns, a write when
+its WR command issues. The masters see it the next cycle. Bank and row state,
+refresh, FR-FCFS scheduling and the controller's queues all count. The data
+still lives in atalla-sim's DRAM, so results are the same and only the timing
+changes.
+
+The configuration is named (`--dram-config`, `DRAM_CONFIGS`), and any value in
+it, or any of Ramulator's DDR4 values, can be changed with
+`--dram-param NAME=VALUE` (`RamulatorDRAM(config, **overrides)` from Python):
+
+| | `rtl` (default) | `ddr4-1600` | `ddr_cntrl` |
+|---|---|---|---|
+| from | `memory_FA26`: the AXI bus's Ramulator wrapper (`rtl/modules/memory/ramulator_wrapper`, `configs/ddr4_config.yaml`) | the DDR controller's organization (`ddr_cntrl_final`: `rtl/include/ddr_cntrl/dram_pkg.vh`) | the same, with the controller's own timings |
+| `org` | `DDR4_8Gb_x16`, 64-bit channel | `DDR4_4Gb_x8` | `DDR4_4Gb_x8` |
+| `ranks`, `channels` | 2, 1 | 2, 1 | 2, 1 |
+| `preset` | `DDR4_3200W` (CL-RCD-RP 20-20-20, tCK 0.625 ns) | `DDR4_1600J` (10-10-10, tCK 1.25 ns) | `DDR4_1600J` and the values below |
+| memory cycles per 800 MHz cycle | 2 (`ramulator_sv_wrapper.sv` ticks twice a clock) | 1 | 1 |
+| `read_buffer`, `write_buffer` | 256, 64 | 32, 32 | 32, 32 |
+| `coalesce_bytes` | 64: a read to a 64-byte block already being read shares that read (`ramulator_dpi.cpp`) | 0 | 0 |
+| `mapper`, `row_policy` | `RoBaRaCoCh`, `Open` | same | same |
+| `relu.c`, through the AXI bus | 861 cycles | 1,672 | 5,729 |
+| `relu.c`, `--no-axi` | 894 | 1,740 | 6,481 |
+
+(`relu.c` takes 664 cycles with the fixed channel, 728 with the fixed DRAM
+behind the bus, and 613 with an ideal one.) `clock_ratio` is the memory
+cycles run per core cycle: 2 in `rtl`, as the wrapper ticks Ramulator twice a
+clock whatever the standard; `clock_ratio=None` takes it from tCK and the
+800 MHz core clock instead, as `ddr4-1600` does, so another preset
+(`preset=DDR4_2400R`) or `tCK_ps` changes it too.
+
+Every request is one 64-byte DDR4 transaction, however few bytes it carries:
+with the 8-byte requests the masters make, a stream of row hits in one bank
+group moves 8 bytes every tCCD_L. `rtl`'s merged reads recover much of
+that: without them (`coalesce_bytes=0`) `relu.c` takes 1,432 cycles.
+
+`ddr_cntrl` takes `dram_pkg.vh`'s values (`ddr_cntrl_final`) where they leave DDR4-1600J:
+
+| | DDR4-1600J | `ddr_cntrl` | |
+|---|---|---|---|
+| nCL | 10 | 11 | the controller waits tRL = tAL + tCL; Ramulator has no AL, so it is folded into CL. DDR4 allows AL = 0, CL − 1 or CL − 2 only |
+| nCWL | 9 | 10 | 10 is DDR4-1866's |
+| nRAS | 28 | 45 | legal, slower |
+| nRC | 38 | 55 | tRAS + tRP |
+| nRFC | 208 | 172 | under the 260 ns a 4Gb part needs |
+| nREFI | 6240 | 250 | shortened in the RTL to watch refreshes: with nRFC 172 the device refreshes most of the time |
+
+The controller sets no tRRD, tCCD, tFAW, tWTR or tRTP; `ddr_cntrl` uses
+DDR4-1600J's. The model sleeps while nothing is in flight and runs the cycles
+it skipped before its next request, so refresh lands where it would if every
+cycle had ticked.
+
+**Checked against the RTL.** `tools/memory_bench.py` runs the DRAM subsystem
+report's measurements (Spring 2026) on the model. Tables 3 and 4 follow the
+wrapper's own bench, `tb/unit/memory/ramulator_wrapper/test_sdma.sv` on
+`memory_FA26`: a 1024×1024 int16 matrix read through the wrapper in 32-byte
+beats, one AR offered a cycle, row-major and then tile-major, in single-beat
+reads (table 3) or 2-beat bursts, one per 64-byte tile row (table 4), with
+the branch's `configs/ddr4_*.yaml`. Every one of the 20 DDR4 rows lands
+within 0.2% of the report's cycles, and the stall percentages agree to
+0.1 points:
+
+| config | single-beat row-major | tile-major | 2-beat bursts row-major | tile-major |
+|---|---|---|---|---|
+| DDR4 1ch 128b | 207,760 / 207,824 | 137,945 / 138,126 | 70,972 / 70,802 | 69,516 / 69,578 |
+| DDR4 1ch 256b | 241,824 / 242,003 | 190,437 / 190,603 | 103,993 / 104,017 | 86,981 / 87,037 |
+| DDR4 1ch 512b | 258,944 / 259,211 | 258,948 / 259,510 | 121,181 / 121,273 | 121,166 / 121,262 |
+| DDR4 2ch 128b | 104,138 / 104,145 | 90,605 / 90,679 | 65,737 / 65,737 | 65,647 / 65,647 |
+| DDR4 4ch 128b | 65,917 / 65,924 | 66,291 / 66,299 | 65,562 / 65,562 | 65,686 / 65,686 |
+
+(model / report, cycles.) What is left is Ramulator 2.1 against the 2.0 the
+wrapper links, and where the bench's write phase leaves refresh. The
+saturated burst rows show the wrapper's 8,192 burst slots at work: the bench
+offers its 32,768 bursts faster than one beat a cycle drains them, so once
+the slots fill a burst goes in every other cycle, and 25% of the cycles
+stall in both. The HBM3 rows are left out: their `HBM3_8Gb` preset is
+Ramulator 2.0's, which 2.1 replaced.
+
+Table 1 (the bus with a zero-latency DRAM) was measured on the earlier,
+two-scratchpad interconnect, and no bench for it is in the repository. Today's
+bus, driven as fast as its masters can with `axi_tb.sv`'s burst lengths,
+reads at 7.99 B/cycle (100%: one R beat a cycle) and writes at 6.04 B/cycle
+(76%: 2-3 idle cycles between bursts), against the report's 3.28 and 2.23
+for the old design.
+
+```bash
+python tools/memory_bench.py all                        # about five minutes
+python tools/memory_bench.py table4 --config "DDR4 2ch 128b"
+```
+
 ## Performance monitor
 
-`build_atalla_platform` attaches a `PerfMonitor` (`src/atalla/perf_monitor.py`)
-as `platform.perf`: a read-only observer, ticked last every cycle, that
-gathers metrics for workload and system analysis. `tools/run_kernel.py`
-prints its summary; `--perf-json PATH` writes the report, and `--timeline`
-adds the per-cycle record.
+`build_atalla_platform(perf=True)` attaches a `PerfMonitor`
+(`src/atalla/perf_monitor.py`) as `platform.perf`: a read-only observer,
+ticked last every cycle, that gathers metrics for workload and system
+analysis. It is off by default (it costs about 7% of run time), as is every
+other recorder. `tools/run_kernel.py --report` prints its summary;
+`--perf-json PATH` writes the report, and `--timeline` adds the per-cycle
+record.
 
 - **Where the cycles go.** Every cycle goes in one bucket, which together
   add up to the run: `issue` (a packet issued); `stall:hazard:<unit>` (decode
@@ -385,7 +522,7 @@ sums, `softmax`'s outputs differ by at most 2 BF16 steps.
 
     C --atalla_cc -p -S--> packetized assembly --src/scheduler/assembler.py--> image
 
-`third_party/aihw-ppci-compiler` (branch `atalla-shaunak`) packetizes: its
+`third_party/aihw-ppci-compiler` (branch `atalla-arch`) packetizes: its
 output is already four-slot packets, padded with `nop`, a packet per label,
 within the scheduler's slot limits. The assembler only encodes and lays out
 what it is given (a `jal x1, main; halt.s` bootstrap first, `li.s` expanded),
@@ -399,15 +536,40 @@ are in `tools/c_kernels.py`. It runs with the C loader's stack registers set
 (`c_entry_sregs`: `x2` and `x33` above the data, as the functional sim's
 loader does).
 
+**Linked programs (ELF).** `atalla_cc kernel.c -o kernel.elf` compiles and
+links with the compiler's memory layout: code from `0x1000`, data (globals)
+from `0x80000`. `src/scheduler/elf.py` loads it into the same program image:
+
+    C --atalla_cc -p--> ELF --src/scheduler/elf.py--> image + data + symbols
+
+- It checks the header (ELF32, little-endian, machine `0x270F`; the linker
+  writes type REL, with no program headers and entry 0, and EXEC is accepted
+  too) and loads every allocated section at its address: executable ones as
+  packets (5-byte little-endian instructions, slot 0 at the lowest address),
+  the others into DRAM as 32-bit words.
+- Every function and label must start a packet. The startup packets
+  `jal x1, main; halt.s` go at address 0, as for the assembly path, and the
+  stack registers come from `c_entry_sregs`.
+- The symbol table names pcs in messages: a run that doesn't halt reports
+  `pc 0x10a4, main_block2`.
+
+`tools/run_kernel.py kernel.elf` runs a linked program; `relu.c --elf`
+compiles, links and loads one, with the harness's inputs and reference.
+Cycle counts differ slightly from the assembly path because the code sits
+at `0x1004`, not 40, and lines up differently with the icache.
+
+Some kernels seed their inputs inside the layout's code region (`relu`'s at
+`0x1000`). atalla-sim keeps the program apart from DRAM, so they still run,
+but in a single memory, as on the RTL testbench, the inputs would overwrite
+the code: `c_kernels.build(..., elf=True)` warns (`ElfLayoutWarning`).
+
 Against the functional sim (`tests/scheduler/test_kernels.py` lists each case):
 
 | | programs |
 |---|---|
-| identical | add, relu, maxpool, maxpool_2x2, softmax, conv_*, gemm_tiled_pipelined, gemm_tiled_pipelined_unrolled, scalar_sum_loop, sqrt_perfect_square |
-| differ: a DMA race | scpad_load_roundtrip: its vector load reads the scratchpad before its DMA has filled it (the functional sim has no timing, so it never races) |
+| identical | relu, maxpool, maxpool_2x2, softmax, layernorm, conv_*, gemm_tiled_baseline, gemm_tiled_pipelined, gemm_tiled_pipelined_unrolled, scalar_sum_loop, sqrt_perfect_square |
+| differ: a missing DMA dependency | add, scpad_load_roundtrip: a vector load reads the scratchpad before its DMA has filled it (the functional sim has no timing, so its DMAs are always done) |
 | differ: `vector_load` on a DRAM address | 9 unit tests: only the functional sim allows it; the hardware's `vreg.ld` reads the scratchpad |
-| differ: `num_cols` | gemm_tiled_baseline, in a vector register only (DRAM matches): `vreg.ld`/`vreg.st` move 32 lanes where the functional sim moves `num_cols + 1` |
-| differ: misaligned `sw.s` | layernorm (stack only): aligned down here, written at the byte address there |
 
 ### Which kernels compute what they claim
 
@@ -418,11 +580,10 @@ wrong: both simulators then run the same wrong program.
 
 | kernel | result | problem |
 |---|---|---|
-| C `add`, `scalar_sum_loop`, `sqrt_perfect_square` | correct | |
-| C `scpad_load_roundtrip` | a race, from a compiler bug | the kernel passes the same address variable to `scpad_load` and `vector_load`, which is all C can say. But a `vreg.ld` waits for a DMA only by reading the register the DMA holds (its `rs1`, which the RTL's decode 2 marks busy until the DMA is done), and the compiler doesn't model that: `scpad_load` returns nothing in its IR, the address is put in a new register for the load, and the packetizer assumes a fixed 13-cycle DMA. The load reads stale data unless the DMA finishes first, as it did with 32-byte bursts. `relu` loads its zero vector the same way, harmlessly |
+| C `scalar_sum_loop`, `sqrt_perfect_square` | correct | |
+| C `add`, `scpad_load_roundtrip` | wrong: a missing dependency (compiler) | the kernel passes the same address variable to `scpad_load` and `vector_load`, which is all C can say. But a `vreg.ld` waits for a DMA only by reading the register the DMA holds (its `rs1`, which the RTL's decode 2 marks busy until the DMA is done), and the compiler doesn't model that: `scpad_load` returns nothing in its IR, the address is put in a new register for the load, and the packetizer assumes a fixed 13-cycle DMA. The load reads stale data unless the DMA finishes first, as it does with 32-byte DRAM requests (`add` then passes) but not with the RTL's 8. `relu` loads its zero vector the same way, harmlessly |
 | C `relu`, `maxpool` | correct, by luck | they rely on a masked op leaving its masked-off lanes holding the destination's old value, which the intrinsics don't define; it works because the compiler happens to pick the kept value's register as the destination. `maxpool` also reads its zero vector before loading the scratchpad, and pools vertically only (2×1). `relu` writes −0.0 for negative inputs |
 | C `make_mask_eq_vector` | passes without testing anything | it compares a vector with itself, loaded from a DRAM address with no DMA (and from row 1: the second argument of `vector_load` is a row offset, not a row count) |
-| C `softmax`, `layernorm`, `maxpool_2x2` | wrong | known compiler bugs (reductions write lane 0 only; masked-op merge) |
 | C `conv_*`, `gemm_tiled_*` | wrong | weight rows loaded first to last, so output columns are reversed |
 | asm `relu`, `softmax` | correct | `softmax` uses inputs 0..1023, which BF16 can't hold exactly, at an unaligned address (`0xcafa`) |
 | asm `maxpool` | correct for a vertical 2×1 pool | the name and `--pool 2` suggest a 2×2 pool; the width is never pooled |

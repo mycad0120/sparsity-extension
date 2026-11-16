@@ -27,6 +27,11 @@ result. Compares write the mask file. A write offered in cycle v reaches the
 register file in v + 1, through the EX/WB latch. An SDMA's completion clears
 the busy bit on its rs1 the same way.
 
+A vreg.st's row carries its rs1 (meta "vst_rd") to the scratchpad; when the
+pad's SRAM write is done, its bridge calls vst_committed, and the release goes
+through the EX/WB latch like an SDMA's completion, freeing one of decode 2's
+vreg.st reservations on that rs1 (decode2.VstReservations).
+
 Where the RTL is wrong this does what was meant: all four VLSUs write back,
 the write ports are chosen by the register file's bank vd[1:0], and lw.vi
 writes no register.
@@ -198,6 +203,11 @@ class VectorSide:
         self._vlsu_holds: Dict[int, Deque] = {s: deque() for s in range(len(vc.vls_units))}
         self.sdma_busy = [False] * max(4, len(self.backends))
         self._sdma_done: List[int] = []           # rs1s whose SDMA finished
+        #: Optional observer, on_sdma("start" | "end", info), for when each
+        #: SDMA is handed to its scratchpad and when it completes
+        #: (atalla/sdma_log.py). None, the default, costs nothing.
+        self.on_sdma: Optional[Callable[[str, Dict], None]] = None
+        self._vst_done: List[int] = []            # rs1s of vreg.st rows written
         #: Transpose requests in program order, ("push", vector) or
         #: ("pop", vd), not yet given to the unit; the vds of tpop.vi waiting
         #: for their column; and the columns left in the drain under way.
@@ -303,7 +313,7 @@ class VectorSide:
                 self._dispatch_lanes(o, ops)
         for o in pkt.sdma:
             if o.valid:
-                self._dispatch_sdma(o, issued.operands.get(("sdma", o.slot), {}))
+                self._dispatch_sdma(o, issued.operands.get(("sdma", o.slot), {}), issued.pc)
 
     def mts_op(self, issued) -> Tuple[Optional[VectorOp], Dict]:
         if issued is None:
@@ -415,12 +425,13 @@ class VectorSide:
             self.stats["vlsu_loads"] += 1
         else:
             data = [bf16_bits(x) for x in ops["vs1"]]
+            # vst_rd: the reservation the scratchpad releases once the row is written
             op = {"kind": "store", "scratchpad": 0, "data": data, "addr": addr,
-                  "vl": o.num_cols + 1}
+                  "vl": o.num_cols + 1, "meta": {"vst_rd": o.rs1}}
             self.stats["vlsu_stores"] += 1
         assert vls.enqueue_issue(op), "VLSU %d issued while not ready" % o.sid
 
-    def _dispatch_sdma(self, o: SdmaOp, ops: Dict) -> None:
+    def _dispatch_sdma(self, o: SdmaOp, ops: Dict, pc: int = 0) -> None:
         meta = int(ops["rs3"]) & MASK32
         sid = (meta >> 30) & 3
         rows, cols = ((meta >> 25) & 0x1F) + 1, ((meta >> 20) & 0x1F) + 1
@@ -428,14 +439,23 @@ class VectorSide:
         stride = (full + 1 if full else cols) * 2
         be = self.backends[sid]
         rs1 = o.rs1_rd
+        row, dram_addr = self._row(ops["rs1"]), int(ops["rs2"]) & MASK32
+        hook, info = self.on_sdma, None
+        if hook is not None:
+            info = dict(op="scpad.st" if o.store else "scpad.ld", pc=int(pc), sid=sid,
+                        rs1=rs1, spad_row=row, dram_addr=dram_addr, rows=rows, cols=cols,
+                        dram_stride=stride, bytes=rows * cols * 2)
 
-        def done(_tx, _rs1=rs1, _sid=sid):
+        def done(_tx, _rs1=rs1, _sid=sid, _hook=hook, _info=info):
             self._sdma_done.append(_rs1)
             self.sdma_busy[_sid] = False
+            if _hook is not None:
+                _hook("end", _info)
 
         start = be.driver_to_backend_start_store if o.store else be.driver_to_backend_start_load
-        tx = start(self._row(ops["rs1"]), int(ops["rs2"]) & MASK32, rows, cols,
-                   callback=done, dram_stride=stride)
+        if hook is not None:
+            hook("start", info)
+        tx = start(row, dram_addr, rows, cols, callback=done, dram_stride=stride)
         assert tx >= 0, "scratchpad %d backend refused an SDMA" % sid
         self.sdma_busy[sid] = True
         self.stats["sdma_stores" if o.store else "sdma_loads"] += 1
@@ -448,6 +468,15 @@ class VectorSide:
 
     def take_sdma_done(self) -> List[int]:
         done, self._sdma_done = self._sdma_done, []
+        return done
+
+    def vst_committed(self, sid: int, rd: int) -> None:
+        """Scratchpad `sid` has written a vreg.st's row: release one
+        reservation on its rs1 `rd` (the RTL's vec_wr_done)."""
+        self._vst_done.append(int(rd))
+
+    def take_vst_done(self) -> List[int]:
+        done, self._vst_done = self._vst_done, []
         return done
 
     @property

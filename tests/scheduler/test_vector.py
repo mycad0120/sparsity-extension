@@ -119,7 +119,7 @@ def values(rr, col):
 
 def run_platform(prog, data, warm_icache=True):
     """Warm icache by default: these tests time the vector side, not fetch."""
-    plat = build_atalla_platform(prog, data, warm_icache=warm_icache)
+    plat = build_atalla_platform(prog, data, warm_icache=warm_icache, history=True)
     plat.run_until_done(limit=200_000)
     return plat
 
@@ -143,7 +143,7 @@ def compare_to_golden(prog, data):
 # -- the register files ---------------------------------------------------------------
 
 def test_v0_reads_zero_and_m0_reads_every_lane():
-    c = SchedulerCore({})
+    c = SchedulerCore({}, history=True)
     assert c.decode2.vrf.read(0) == [0.0] * 32
     assert c.decode2.mrf.read(0) == 0xFFFFFFFF
 
@@ -302,7 +302,7 @@ def test_gemm_writes_back_and_lw_vi_reserves_nothing():
     pk = prologue() + [(vi("lw.vi", 0, 8 + k % 8, 0),) for k in range(32)]
     plat = build_atalla_platform(program(*pk, vv("gemm.vv", 20, 9, 0),
                                             vv("gemm.vv", 21, 10, 0), HALT),
-                                    tile_data(DRAM_IN, LOAD_ROWS, values))
+                                    tile_data(DRAM_IN, LOAD_ROWS, values), history=True)
     plat.run_until_done(limit=50_000)
     c = plat.core
     assert c.vector.stats["gsau_ops"] == 34
@@ -328,3 +328,50 @@ def test_transpose_pushes_rows_and_pops_columns():
     first_push = min(cy for pc, cy in t.items() if pc >= 20 * (len(pk) - 64))
     # 32 pushes at 5 cycles and a 193-cycle drain, at least
     assert plat.cycle - first_push >= 32 * 5 + 32 * 6
+
+
+# -- vreg.st -> scpad.st ordering -----------------------------------------------------------
+
+DRAM_PRE = 0xC000
+
+
+def backlog_program():
+    """A store queue backed up in front of the SDMA that reads it.
+
+    Pad 0's rows 28-31 (tile B, base x5) are first filled from DRAM_PRE with
+    a pattern. 32 back-to-back vreg.st then go to tile A (rows 0-27), 4 more
+    with different data to tile B, and tile B's scpad.st follows at once. The
+    vector stores wait in the VLSU's queue and the pad's write queue, so
+    without the vreg.st reservation the DMA's reads of tile B can overtake
+    them and DRAM gets the pattern back.
+    """
+    row_b = 28
+    pk = list(prologue())                                  # v8..v15 <- 8 rows
+    pk += [*base(5, row_b * 64), *base(1, DRAM_PRE), *base(3, meta(0, 4)),
+           (sdma("scpad.ld", 5, 1, 3),)]
+    pk += [(i("addi.s", 10 + k, 0, k),) for k in range(28)]
+    pk += [(vv("add.vv", 16 + k, 8 + k, 8 + k),) for k in range(4)]   # tile B = 2 x A
+    pk += [*base(6, DRAM_OUT), *base(7, meta(0, 4))]
+    pk += [(vmem("vreg.st", 8 + k % 8, 2, 10 + k % 28),) for k in range(32)]
+    pk += [(vmem("vreg.st", 16 + k, 5, 10 + k),) for k in range(4)]
+    pk += [(sdma("scpad.st", 5, 6, 7),), HALT]
+    data = {**tile_data(DRAM_IN, LOAD_ROWS, values),
+            **tile_data(DRAM_PRE, 4, lambda rr, col: 100.0 + rr)}
+    return program(*pk), data
+
+
+@pytest.mark.golden
+def test_backlog():
+    """The scpad.st waits for the 4 tile-B vreg.st to be written.
+
+    At the platform's PCACTI bank latencies (read 2, write 1) the write
+    channel takes a row a cycle, as fast as one VLSU fills it, so the queue
+    never backs up far enough for the DMA to overtake a store: this passes
+    with or without the rule (checked by hand, 2026-10-28) and pins the
+    rule's cost. With the RTL instance's latencies (3 / 3 in the sim) the
+    same program fails without the rule, as the RTL tb's
+    VST_SCPAD_ST_UNGATED_BACKLOG does."""
+    prog, data = backlog_program()
+    plat = compare_to_golden(prog, data)
+    assert plat.core.decode2.stall_reasons.get("vst", 0) > 0
+    assert plat.core.decode2.vst.idle

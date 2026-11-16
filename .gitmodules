@@ -4,4 +4,7 @@
 [submodule "third_party/aihw-ppci-compiler"]
 	path = third_party/aihw-ppci-compiler
 	url = git@github.com:Purdue-SoCET/aihw-ppci-compiler.git
-	branch = atalla-shaunak
+	branch = atalla-arch
+[submodule "third_party/ramulator2"]
+	path = third_party/ramulator2
+	url = https://github.com/CMU-SAFARI/ramulator2
